@@ -114,7 +114,37 @@ The attention score between two tokens is the dot product of one's query with th
 6. **Dropout** randomly zeros some attention weights during training
 7. **Weighted sum** of values: `weights @ V` produces the output
 
-The `tril` (lower triangular) mask is registered as a **buffer** (not a parameter) so it's saved with the model but not trained. The `[:T, :T]` slicing handles sequences shorter than `block_size` during generation.
+### The Causal Mask (`tril`) in Detail
+
+`torch.tril(torch.ones(block_size, block_size))` builds a **lower triangular matrix** of 1s. For `block_size=5` it looks like:
+
+```
+1 0 0 0 0
+1 1 0 0 0
+1 1 1 0 0
+1 1 1 1 0
+1 1 1 1 1
+```
+
+`register_buffer('tril', ...)` saves it as part of the module's state (it moves with `.to(device)` and is included in `state_dict`) but it is **not a learnable parameter** - it's a fixed mask.
+
+**Why it's needed.** After computing raw attention scores `weights = q @ k.T` (shape `[B, T, T]`), every position `i` has a score against every other position `j`. Without masking, position 2 could attend to position 4 - i.e., a token could "see the future." The line:
+
+```python
+weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+```
+
+sets all entries **above the diagonal** to `-inf`. After `softmax`, those `-inf` entries become `0`, so:
+
+- Token at position 0 only attends to position 0
+- Token at position 1 attends to positions 0 and 1
+- Token at position `i` attends to positions `0..i`
+
+**Why this matters for a GPT.** The model is trained to predict the next token. During training the whole sequence is fed in parallel and a loss is computed at every position simultaneously - but each position must only use information from earlier positions, otherwise the model would trivially "cheat" by reading the answer. The triangular mask enforces that constraint inside the parallel matmul.
+
+**Why slice `[:T, :T]`.** `tril` is pre-allocated at the maximum `block_size`, but the actual sequence length `T` in a forward pass may be shorter (e.g., during generation when the context is still being built up). `self.tril[:T, :T]` grabs the top-left `T x T` corner so the mask matches the current attention matrix's shape.
+
+**Encoder vs. decoder.** A BERT-style encoder would *not* use this mask - it wants bidirectional context. The triangular mask is the single line that turns a generic self-attention block into a *decoder/causal* block, which is what makes this a GPT.
 
 ---
 
